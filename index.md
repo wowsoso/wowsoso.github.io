@@ -361,7 +361,7 @@ makecontext函数要求的,在调用makecontext函数前,必须为参数ucp分�
 
 这个实现有点tricky, 画副图说明:
 
-![libtask1](https://wowsososo.github.io/images/libtask1.png)
+![libtask1](https://wowsoso.github.io/images/libtask1.png)
 
 所以当 (char*)&t <= (char*)t->task时,说明栈空间不够了.
 
