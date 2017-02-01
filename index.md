@@ -1,3 +1,355 @@
+## python下协程实现原理与greenlet源码解析
+
+greenlet是一个高效的python协程扩展,与libtask不同,由于greenlet是跑在
+python虚拟机上的,而python虚拟机在操作系统上模拟了进程,线程与栈帧结构,
+所以greenlet协程在做切换时必须同时切换python虚拟机的栈帧与操作系统进程
+的栈帧.而这也是greenlet实现比较tricky的地方,要搞清楚greenlet的具体实
+现机制,必须先搞清楚python的三个重要结构体:
+
+  PyFrameObject
+  PyInterpreterState
+  PyThreadState
+
+先来看看PyFrameObject:
+
+```c
+    typedef struct _frame {
+        // PyFrameObject就是python虚拟机的栈帧结构,
+        // 也就是一段python的执行代码片,包括:
+        // 指向前一个栈帧的指针, 执行代码片地址,builtins dict, globals dict, locals dict
+        // 指向最后一个local地址的指针,指向栈顶地址的指针, 代码片所在线程的指针, 第一个local地址的指针
+
+        PyObject_VAR_HEAD
+        // f_back指向调用者的栈帧
+        struct _frame *f_back;	/* previous frame, or NULL */
+        // 执行代码片
+        PyCodeObject *f_code;	/* code segment */
+        PyObject *f_builtins;	/* builtin symbol table (PyDictObject) */
+        PyObject *f_globals;	/* global symbol table (PyDictObject) */
+        PyObject *f_locals;		/* local symbol table (any mapping) */
+        // f_valuestack指向最后一个local地址
+        PyObject **f_valuestack;	/* points after the last local */
+        /* Next free slot in f_valuestack.  Frame creation sets to f_valuestack.
+           Frame evaluation usually NULLs it, but a frame that yields sets it
+           to the current stack top. */
+        // f_stacktop指向栈顶, 当线程初始化时,f_stacktop和f_valuestack指向相同地址
+        PyObject **f_stacktop;
+        PyObject *f_trace;		/* Trace function */
+
+        /* If an exception is raised in this frame, the next three are used to
+         * record the exception info (if any) originally in the thread state.  See
+         * comments before set_exc_info() -- it's not obvious.
+         * Invariant:  if _type is NULL, then so are _value and _traceback.
+         * Desired invariant:  all three are NULL, or all three are non-NULL.  That
+         * one isn't currently true, but "should be".
+         */
+        PyObject *f_exc_type, *f_exc_value, *f_exc_traceback;
+
+        PyThreadState *f_tstate;
+        int f_lasti;		/* Last instruction if called */
+        /* Call PyFrame_GetLineNumber() instead of reading this field
+           directly.  As of 2.3 f_lineno is only valid when tracing is
+           active (i.e. when f_trace is set).  At other times we use
+           PyCode_Addr2Line to calculate the line from the current
+           bytecode index. */
+        int f_lineno;		/* Current line number */
+        int f_iblock;		/* index in f_blockstack */
+        PyTryBlock f_blockstack[CO_MAXBLOCKS]; /* for try and loop blocks */
+        // f_localsplus指向第一个local
+        PyObject *f_localsplus[1];	/* locals+stack, dynamically sized */
+    } PyFrameObject;
+```
+
+下面是PyInterpreterState结构的源码:
+
+```c
+typedef struct _is {
+    // _is是Python虚拟机下的进程模拟
+
+    // next指向下一个Python虚拟机进程
+    struct _is *next;
+    // 指向这个进程的第一个线程
+    struct _ts *tstate_head;
+
+    // 存储当前进程下共享的modules,sysdict,builtins,
+    PyObject *modules;
+    PyObject *sysdict;
+    PyObject *builtins;
+    PyObject *modules_reloading;
+
+    PyObject *codec_search_path;
+    PyObject *codec_search_cache;
+    PyObject *codec_error_registry;
+
+#ifdef HAVE_DLOPEN
+    int dlopenflags;
+#endif
+#ifdef WITH_TSC
+    int tscdump;
+#endif
+} PyInterpreterState;
+```
+
+假如我们用编译型语言去实现一套协程机制,比如c, 其实是非常简单的,我们可
+能只需要一个合理的上下文结构, 一套用于保存,恢复的上下文切换函数就可以
+了, 但对于Python这种使用虚拟机模拟进程/线程结构的语言,做一次协程的上下
+文切换,我们不仅要切换真实操作系统的上下文,同时也要切换虚拟机模拟的上下
+文.因此, greenlet的实现有很多tricky的点, 在对源码的分析过程中遇到了不
+少麻烦, 下面仅以我个人阅读greenlet源码的路径来分析一下这个在生产环境下
+被使用无数的Python协程框架.
+
+1. 基本执行单元
+
+Task是一个协程的基本执行单元, 下面是greenlet源码里对Task的抽象:
+
+```c
+    typedef struct _greenlet {
+        PyObject_HEAD
+        // stack_start指向task的栈顶, 在main_task里, stack_start是-1,
+        // 因为greenlet无法知道真实的栈顶地址,所以用-1表示最大的地址
+        char* stack_start;
+        // stack_stop指向栈底, main_task没有stack_stop,用1表示最小的地址.
+        char* stack_stop;
+        // stack_copy是指的保存在堆上的数据,当做上下文切换前,会把当前task的stack上
+        // 的数据保存在堆上,切换之后再恢复入栈.
+        char* stack_copy;
+        // 标识当前是否已经把数据保存到堆上
+        intptr_t stack_saved;
+        // 比如在task1里切换到task2, 那么task2的stack_prev就指向task1
+        struct _greenlet* stack_prev;
+        // 指向父task
+        struct _greenlet* parent;
+        // 指向python线程的dict,通常是用于比较task是否属于当前线程(是否是在当前线程里创建的),
+        // 在一个greenlet对象初始化时(非main greenlet task), 也用来暂存callback对象的指针
+        PyObject* run_info;
+        // 指向执行栈帧
+        struct _frame* top_frame;
+        // 递归深度,与所属线程保持一致
+        int recursion_depth;
+        PyObject* weakreflist;
+        PyObject* exc_type;
+        PyObject* exc_value;
+        PyObject* exc_traceback;
+        // 当前Python线程的dict字段
+        PyObject* dict;
+    } PyGreenlet;
+```
+
+下面是创建main task的源码:
+
+```c
+    static PyGreenlet* green_create_main(void)
+    {
+        PyGreenlet* gmain;
+        PyObject* dict = PyThreadState_GetDict();
+        if (dict == NULL) {
+            if (!PyErr_Occurred())
+                PyErr_NoMemory();
+            return NULL;
+        }
+
+        /* create the main greenlet for this thread */
+        gmain = (PyGreenlet*) PyType_GenericAlloc(&PyGreenlet_Type, 0);
+        if (gmain == NULL)
+            return NULL;
+        gmain->stack_start = (char*) 1;
+        gmain->stack_stop = (char*) -1;
+        gmain->run_info = dict;
+        Py_INCREF(dict);
+        return gmain;
+    }
+```
+
+对main task的初始化与task的初始化不同,初始化main task不用设置run属性
+(grennlet的callback函数),稍后介绍普通task的初始化时会提到run属
+性.maintask对greenlet框架的使用者是透明的,在import greenlet时会执行初
+始化操作,每个线程都可以有自己的main task,它的stack_stop属性永远
+为-1, stask_start属性永远为1
+
+
+下面是创建并初始化task的源码:
+
+```c
+    static PyObject* green_new(PyTypeObject *type, PyObject *args, PyObject *kwds)
+    {
+        // 此函数构造一个新的greenlet task并返回, 设置新的task的parent为当前的task
+        PyObject* o = PyBaseObject_Type.tp_new(type, ts_empty_tuple, ts_empty_dict);
+        if (o != NULL) {
+            if (!STATE_OK) {
+                Py_DECREF(o);
+                return NULL;
+            }
+            Py_INCREF(ts_current);
+            ((PyGreenlet*) o)->parent = ts_current;
+        }
+        return o;
+    }
+
+    static int green_init(PyGreenlet *self, PyObject *args, PyObject *kwargs)
+    {
+        // 此函数初始化一个greenlet task, 设置run_info为参数run, 设置parent为参数parent
+        PyObject *run = NULL;
+        PyObject* nparent = NULL;
+        static char *kwlist[] = {"run", "parent", 0};
+        if (!PyArg_ParseTupleAndKeywords(args, kwargs, "|OO:green", kwlist,
+                         &run, &nparent))
+            return -1;
+
+        if (run != NULL) {
+            if (green_setrun(self, run, NULL))
+                return -1;
+        }
+        if (nparent != NULL && nparent != Py_None)
+            return green_setparent(self, nparent, NULL);
+        return 0;
+    }
+```
+
+在green_init函数里有调用green_setrun函数,green_setrun函数会把指定的回
+调函数对象的指针暂时赋值给task的run_info字段, 当切换到此task时会调用它:
+
+```c
+    result = PyEval_CallObjectWithKeywords(
+        run, args, kwargs);
+```
+
+上面的源码对应于:
+
+```python
+    import greenlet
+
+    def foo(...):
+        ....
+
+    greenlet.greenlet(foo, ...)
+```
+
+python解释器执行imoirt greenlet时会初始化greenlet的 main_task, 执行
+greenlet.greenlet(foo, ...)时会调用green_new创建一个greenlet task并调
+用green_init初始化它.
+
+关于切换, 之前提到greenlet的切换不仅要切换python解释器模拟的栈帧,同时
+也要切换操作系统进程的栈帧：
+
+```c
+    static int g_switchstack(void)
+    {
+        // 这个函数分为三个部分, 保存Python虚拟机栈帧,保存并恢复操作系统进程栈帧,恢复Python虚拟机栈帧
+        // 1. 在保存阶段, 会把当前线程的上下文数据赋给当前greenlet task,
+        // 2. 然后进入操作系统进程栈帧切换阶段: 执行slp_switch函数, 这个函数非常关键,接下来会详细描述,
+        // 3. 最后进入恢复阶段, 把切换目标的上下文数据写入当前线程
+        int err;
+        {   /* save state */
+            PyGreenlet* current = ts_current;
+            PyThreadState* tstate = PyThreadState_GET();
+            current->recursion_depth = tstate->recursion_depth;
+            current->top_frame = tstate->frame;
+            current->exc_type = tstate->exc_type;
+            current->exc_value = tstate->exc_value;
+            current->exc_traceback = tstate->exc_traceback;
+        }
+        err = slp_switch();
+        if (err < 0) {   /* error */
+            PyGreenlet* current = ts_current;
+            current->top_frame = NULL;
+            current->exc_type = NULL;
+            current->exc_value = NULL;
+            current->exc_traceback = NULL;
+
+            assert(ts_origin == NULL);
+            ts_target = NULL;
+        }
+        else {
+            PyGreenlet* target = ts_target;
+            PyGreenlet* origin = ts_current;
+            PyThreadState* tstate = PyThreadState_GET();
+            tstate->recursion_depth = target->recursion_depth;
+            tstate->frame = target->top_frame;
+            target->top_frame = NULL;
+            tstate->exc_type = target->exc_type;
+            target->exc_type = NULL;
+            tstate->exc_value = target->exc_value;
+            target->exc_value = NULL;
+            tstate->exc_traceback = target->exc_traceback;
+            target->exc_traceback = NULL;
+
+            assert(ts_origin == NULL);
+            Py_INCREF(target);
+            ts_current = target;
+            ts_origin = origin;
+            ts_target = NULL;
+        }
+        return err;
+    }
+```
+
+slp_switch函数(以x86x64平台为例):
+
+```c
+    static int
+    slp_switch(void)
+    {
+        // 这个函数将切换操作系统进程的栈帧
+        // 按惯例rbp是栈帧, rbx需要被被调用者保存,
+        // stackref存储的是栈顶地址
+
+        int err;
+        void* rbp;
+        void* rbx;
+        unsigned int csr;
+        unsigned short cw;
+        register long *stackref, stsizediff;
+        __asm__ volatile ("" : : : REGS_TO_SAVE);
+        __asm__ volatile ("fstcw %0" : "=m" (cw));
+        __asm__ volatile ("stmxcsr %0" : "=m" (csr));
+        // 保存栈帧至rbp变量
+        __asm__ volatile ("movq %%rbp, %0" : "=m" (rbp));
+        // 保存rbx内容至rbx变量
+        __asm__ volatile ("movq %%rbx, %0" : "=m" (rbx));
+        // 保存栈顶的地址至stackref
+        __asm__ ("movq %%rsp, %0" : "=g" (stackref));
+        {
+            // SLP_SAVE_STATE宏做两件事情:
+            //  1. 把当前greenlet task及它之前的task保存到堆, 界限为目标task的stack_stop
+            //  2. check目标greenlet task是否是running状态,如果不是running状态,则不再执行后面的切换操作了,直接返回
+            //  3. 算出目标greenlet task与当前greenlet task的地址差,用于切换
+            //  当目标greenlet task被首次切换,说明其还不在running状态, 所以直接返回-1,上层函数
+            // initialstub会通过把(char*) 1赋值给目标greenlet task的stack_start,
+            // 从而使stack_start开始有值且值小于stack_stop(因为栈地址分配由下往上),
+            // 然后会调用其run(callback)函数, 执行完毕后将继续进行一次切换,
+            // 而这次切换因为stack_start有值所以会通过SLP_SAVE_STATE宏的步骤2(检测目标greenlet task是否为running),
+            // 然后python解释器会接着往下执行.
+            SLP_SAVE_STATE(stackref, stsizediff);
+            // 到这一步目标greenlet task的run函数已经调用结束了或者执行到某一步待切换
+            // 更改操作系统进程的栈帧,指向目标greenlet task
+            // 由于增长了rsp和rbp的地址(stsizediff个字节), 从而回到了调用switch者(即ts_current)的栈帧
+                __asm__ volatile (
+                "addq %0, %%rsp\n"
+                "addq %0, %%rbp\n"
+                :=-=-
+                : "r" (stsizediff)
+                );
+            // SLP_RESTORE_STATE宏把之前各相关greenlet task保存在堆上的数据写回stack,
+            // 并释放内存空间,重置stack_saved为0
+            SLP_RESTORE_STATE();
+            __asm__ volatile ("xorq %%rax, %%rax" : "=a" (err));
+        }
+        __asm__ volatile ("movq %0, %%rbx" : : "m" (rbx));
+        __asm__ volatile ("movq %0, %%rbp" : : "m" (rbp));
+        __asm__ volatile ("ldmxcsr %0" : : "m" (csr));
+        __asm__ volatile ("fldcw %0" : : "m" (cw));
+        __asm__ volatile ("" : : : REGS_TO_SAVE);
+        // 走到这一步err肯定为0, 操作系统进程栈帧切换完毕,
+        // 之后会回到g_switchstack, 恢复python虚拟机的栈帧, 整个切换过程结束.
+        return err;
+    }
+```
+
+上面就是greenlet的切换过程, slp_switch函数就是整个切换过程的核心实现.在
+python下,通过调用greenlet的switch方法触发调用PyGreenlet_Switch函
+数,PyGreenlet_Switch会调用g_switchstack和g_initialstub函数完成一次切换,具
+体细节可以参考roy的文章：http://rootk.com/post/python-greenlet.html
+
 ## 关于linux下协程的通用实现及libtask库源码解析
 
 协程(coroutine)与subroutine同样作为程序执行单元的抽象被一些语言当作基
@@ -328,12 +680,11 @@ swapcontext实际上是getcontext/setcontext的结合体,比如参照ai64的实�
         void *startarg;
         void *udata;
     };
-    #+END_SRC
-    这个结构体里context就是ucontext_t:
-    #+BEGIN_SRC c
-        struct Context {
-            ucontext_t uc;
-        }
+
+    // 这个结构体里context就是ucontext_t:
+    struct Context {
+        ucontext_t uc;
+    }
 ```
 
 ucontext_t里存储了上下文内容, 也就是swapcontext函数里两个参数的类型stk
