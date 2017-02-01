@@ -53,7 +53,8 @@ getcontext,setcontext,makecontext,swapcontext做了简单的封装,因为这四�
 实现机制.
 
 这里有一个关键的数据结构,即user level context:
-```C
+
+```c
     typedef struct ucontext
       {
         unsigned long int uc_flags;
@@ -98,7 +99,7 @@ makecontext函数将会设置uc\_stack与相应寄存器里的值uc\_stack的结
 
 x86x64环境下makecontext的源码：
 
-```C
+```c
     __makecontext (ucontext_t *ucp, void (*func) (void), int argc, ...)
     {
       extern void __start_context (void);
@@ -178,10 +179,14 @@ x86x64环境下makecontext的源码：
     }
 ```
 
-当需要切换上下文时，需要调用swapcontext, swapcontext接受两个参数,1:当
-前的上下文(u_context), 2:新的上下文(u_context), x86-64下源码如下:
+当需要切换上下文时，需要调用swapcontext, swapcontext接受两个参数,
+  1. 当前的上下文(u_context).
 
-```C
+  2. 新的上下文(u_context).
+
+x86-64下源码如下:
+
+```c
     ENTRY(__swapcontext)
         /* Save the preserved registers, the registers used for passing args,
            and the return address.  */
@@ -287,7 +292,7 @@ x86x64环境下makecontext的源码：
 
 swapcontext实际上是getcontext/setcontext的结合体,比如参照ai64的实现:
 
-```C
+```c
     int
     __swapcontext (ucontext_t *oucp, const ucontext_t *ucp)
     {
@@ -301,7 +306,7 @@ swapcontext实际上是getcontext/setcontext的结合体,比如参照ai64的实�
 之前说到glibc的这4个函数是libtask的基础, 其实更准确的说libtask是其较浅
 的封装,我们先来看看libtask的核心结构:task的实现:
 
-```C
+```c
     struct Task
     {
         char name[256];// offset known to acid
@@ -336,7 +341,7 @@ ucontext_t里存储了上下文内容, 也就是swapcontext函数里两个参数
 makecontext函数要求的,在调用makecontext函数前,必须为参数ucp分配一块地
 址作为上下文的栈空间,libtask会执行初始化工作:
 
-```C
+```c
     t->context.uc.uc_stack.ss_sp = t->stk+8;
     t->context.uc.uc_stack.ss_size = t->stksize-64;
     ...
@@ -345,9 +350,8 @@ makecontext函数要求的,在调用makecontext函数前,必须为参数ucp分�
 在调用swapcontext前,可以通过比较当前context的地址是否大于stk的地址来判
 断栈空间是否够用:
 
-```C
-    void
-    needstack(int n)
+```c
+    void needstack(int n)
     {
         Task *t;
         t = taskrunning;
@@ -367,7 +371,7 @@ makecontext函数要求的,在调用makecontext函数前,必须为参数ucp分�
 
 如果栈空间足够,那么就可以调用swapcontext了:
 
-```C
+```c
     static void
     contextswitch(Context *from, Context *to)
     {
@@ -381,7 +385,7 @@ makecontext函数要求的,在调用makecontext函数前,必须为参数ucp分�
 contextswitch函数是由taskscheduler函数驱动的，taskscheduler是一个task
 全局调度器, 运行在进程的整个生命周期中,调度器结束,进程关闭:
 
-```C
+```c
     static void
     taskscheduler(void)
     {
@@ -428,7 +432,7 @@ contextswitch函数是由taskscheduler函数驱动的，taskscheduler是一个ta
 
 另外contextswitch也可以手工调用,使用taskyield函数:
 
-```C
+```c
     int
     taskyield(void)
     {
@@ -459,7 +463,7 @@ task.c,由自己的程序去调用taskscheduler.另外libtask只是一个基础�
 一个支持并发的系统,难以避免需要与共享内存打交道，不同的执行流访问同一
 块内存区域,如果不解决数据争用的问题,那么就会引发问题:
 
-```C
+```c
    #include <pthread.h>
    #include <stdio.h>
 
@@ -487,7 +491,7 @@ task.c,由自己的程序去调用taskscheduler.另外libtask只是一个基础�
 会被所有线程共享。这段代码存在数据争用的问题,因为函数foo实际上是两条指
 令(在64位环境下用gcc -s可以查看汇编码):
 
-```ASM
+```asm
     foo:
       ...
       movl count(%rip), %eax
@@ -497,7 +501,7 @@ task.c,由自己的程序去调用taskscheduler.另外libtask只是一个基础�
 
 比较常用的解决办法是使用锁把相关的内存区域保护起来:
 
-```C
+```c
    #include <pthread.h>
    #include <stdio.h>
 
@@ -526,7 +530,7 @@ task.c,由自己的程序去调用taskscheduler.另外libtask只是一个基础�
 
 或者使用原子指令:
 
-```C
+```c
    #include <pthread.h>
    #include <stdio.h>
 
@@ -552,7 +556,7 @@ task.c,由自己的程序去调用taskscheduler.另外libtask只是一个基础�
 
 再看编译后的汇编代码:
 
-```ASM
+```asm
    foo:
        lock addl       $2, count(%rip)
 ```
@@ -567,7 +571,8 @@ EXCLUSIVE锁，那么性能是非常低的，因为有时业务在一个事务�
 写操作,但可以读.相对应的锁是ACCESS SHARE锁,这是粒度最小的锁,当还有事务
 在读一张表的时候,也允许其他事务写。postgresql在上面4种锁模式上还做了写
 扩充,具体可以看源码:
-```C
+
+```c
    /* NoLock is not a lock mode, but a flag value meaning "don't get a lock" */
    #define NoLock               0
 
@@ -594,7 +599,7 @@ EXCLUSIVE锁，那么性能是非常低的，因为有时业务在一个事务�
 些行做update操作, 一旦拿到了这把锁,那么其他的表就不能对这些行做dml操作
 了.可以看看这种锁:
 
-```SHELL
+```shell
     >> BEGIN;
     >> select * from t where id=1 for update;
 
@@ -644,7 +649,7 @@ EXCLUSIVE锁，那么性能是非常低的，因为有时业务在一个事务�
 postgresql的锁类型有很多,可以给很多对象加锁，并不限于表和行, 下面列出
 了postgresql所有的锁类型:
 
-```C
+```c
    typedef enum LockTagType
    {
         LOCKTAG_RELATION,/* whole relation */
@@ -741,7 +746,7 @@ MVCC的数据库有很多,但实现机制各不相同,主要区别在于对多�
 列名: xid指的是事务的id,xmin指的是插入或更新该条记录的xid,xmax指的是删
 除或锁定该条记录的xid:
 
-```C
+```c
   typedef struct HeapTupleFields
   {
       TransactionId t_xmin;/* inserting xact ID */
@@ -760,7 +765,7 @@ commited的事务的id,xmax可以认为存的是当前正在对此条行记录�
 
 这里可以实验一下 在两个session里分别开启一个事务, t1和t2:
 
-```SHELL
+```shell
     >> create table t(id integer, detail text);
     >> insert into t (id, detail) values(1,'test1');
     >> select xmin, xmax, * from t;
@@ -824,7 +829,7 @@ commited的事务的id,xmax可以认为存的是当前正在对此条行记录�
 在一个事务内,对于一条记录,每做一次DML操作，postgresql都会存储相关操作
 的结果。只是因为隔离级别的限制,其他事务可能无法读到而已:
 
-```C
+```c
      typedef struct HeapTupleHeaderData
      {
          ...
@@ -836,7 +841,7 @@ commited的事务的id,xmax可以认为存的是当前正在对此条行记录�
 对于每个事务,当执行一次DML操作时,实际上postgresql会为此次操作保存一份
 新的副本,并不会替换之前已经存在的数据, 比如update操作:
 
-```SHELL
+```shell
     >> select ctid, * from t where id=1;
 
     ctid | id | detail
@@ -974,38 +979,3 @@ rollback了,那么数据库必须回滚此次事务中的所有操作。
 
 事务的持久性指的是一旦事务成功提交，那么此事务的执行结果就不应该被丢失。
 其实数据丢失问题是不可能避免的，所以关系数据库大多会提供数据恢复机制。
-
-
-Whenever you commit to this repository, GitHub Pages will run [Jekyll](https://jekyllrb.com/) to rebuild the pages in your site, from the content in your Markdown files.
-
-### Markdown
-
-Markdown is a lightweight and easy-to-use syntax for styling your writing. It includes conventions for
-
-```markdown
-Syntax highlighted code block
-
-# Header 1
-## Header 2
-### Header 3
-
-- Bulleted
-- List
-
-1. Numbered
-2. List
-
-**Bold** and _Italic_ and `Code` text
-
-[Link](url) and ![Image](src)
-```
-
-For more details see [GitHub Flavored Markdown](https://guides.github.com/features/mastering-markdown/).
-
-### Jekyll Themes
-
-Your Pages site will use the layout and styles from the Jekyll theme you have selected in your [repository settings](https://github.com/wowsoso/wowsoso.github.io/settings). The name of this theme is saved in the Jekyll `_config.yml` configuration file.
-
-### Support or Contact
-
-Having trouble with Pages? Check out our [documentation](https://help.github.com/categories/github-pages-basics/) or [contact support](https://github.com/contact) and we’ll help you sort it out.
