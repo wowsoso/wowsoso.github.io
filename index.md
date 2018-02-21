@@ -35,9 +35,11 @@
 
 ### 集中管理式
 还是上面那个例子:
+
 ![Alt text](http://wowsoso-common.oss-cn-beijing.aliyuncs.com/a3.png)
 
 由一个事务管理器处理事务, 当Order向事务管理器发起一次请求, 事务管理器会分别向Payment和Stock调用, 若Payment和Stock都调用成功, 那么事务完成, 否则要执行undo操作:
+
 ![Alt text](http://wowsoso-common.oss-cn-beijing.aliyuncs.com/a4.png)
 
 这两幅图里, 调用关系可以走消息队列, 不一定是request/response.
