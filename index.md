@@ -1,3 +1,62 @@
+## 简单聊聊分布式事务设计思路与取舍
+
+
+
+类似2PC,Paxos之类的强一致性方案在跨多个服务的场景下很吃力, 而且性能也不好, 所以应该考虑基于最终一致性的方案.
+
+基于最终一致性的方案业界有很多方法实践, 比如本地事务表加异步确保,TCC补偿, Saga等, 这些方式可以从编排方式上分为两类: 去中心式和集中管理式. 下面简单聊聊。
+
+### 去中心式
+举个例子, 三个服务: Order, Payment, Stock:
+##### 成功:
+![Alt text](http://wowsoso-common.oss-cn-beijing.aliyuncs.com/a1.png)
+
+#### 失败:
+![Alt text](http://wowsoso-common.oss-cn-beijing.aliyuncs.com/a2%20%282%29.png)
+
+
+每个服务有两种角色, 事件发布者和接受者
+
+事件发布者需要考虑:
+* 存储发送事件, 便于redo 
+* 要有全局事务id式事务可以被追溯
+
+事件接收者需要考虑:
+ *  存储接收的事件, 便于redo或者undo.
+ * redo或者undo需要考虑幂等, 可以依靠全局事务id
+ * 基于redo的方案, 需要在本地维护事件处理状态
+ * 基于undo的方案, 需要考虑补偿方式
+
+
+
+#### 优点:
+* 去中心化设计, 松耦合. 
+* 实现简单.
+ 
+#### 缺点:
+* 对业务有侵入性。
+* 一个事务如果涉及太多服务, 那么会变得复杂, 当然, 这时也应该考虑下服务边界的设计是否有问题。
+* 功能测试比较麻烦, 需要拉起所有服务。
+
+### 集中管理式
+还是上面那个例子:
+![Alt text](http://wowsoso-common.oss-cn-beijing.aliyuncs.com/a3.png)
+
+由一个事务管理器处理事务, 当Order向事务管理器发起一次请求, 事务管理器会分别向Payment和Stock调用, 若Payment和Stock都调用成功, 那么事务完成, 否则要执行undo操作:
+![Alt text](http://wowsoso-common.oss-cn-beijing.aliyuncs.com/a4.png)
+
+#### 优点:
+* 对业务侵入性较小
+* 当事务设计的服务增多, 复杂性线性增长 
+* 比较容易测试
+
+#### 缺点:
+* 实现比较麻烦
+* 中心化的设计其实会造成耦合, 业务逻辑变更频繁的场景, 会很麻烦.
+* 额外的维护成本
+
+Done.
+
 ## python下协程实现原理与greenlet源码解析
 
 greenlet是一个高效的python协程扩展,与libtask不同,由于greenlet是跑在
@@ -807,526 +866,3 @@ task.c,由自己的程序去调用taskscheduler.另外libtask只是一个基础�
 来提升,github上有一个使用epoll的修改版本可以让异步编程更加轻松一点,另
 外如果想要利用多核, 那么还是得加上线程机制,在每个线程里跑多个task,不
 过如果要实现这个要做的工作可就多了.
-
-
-## 关于postgresql的多版本并发控制,表锁与行锁的使用与原理
-
-一个支持并发的系统,难以避免需要与共享内存打交道,不同的执行流访问同一
-块内存区域,如果不解决数据争用的问题,那么就会引发问题:
-
-```c
-   #include <pthread.h>
-   #include <stdio.h>
-
-   int count = 0;
-
-   void* foo(void* arg) {
-       count = count + 2;
-   }
-
-   int main() {
-       pthread_t t1, t2;
-       void* retval;
-       int parg1 = 1;
-       int parg2 = 2;
-
-       pthread_create(&t1, 0, foo, 0);
-       pthread_create(&t2, 0, foo, 0);
-       pthread_join(t1, &retval);
-       pthread_join(t2, &retval);
-       printf ("%d\n", count);
-   }
-```
-
-上面那段程序启动了两个线程, 每个线程都会更新count的值, count是全局变量,
-会被所有线程共享.这段代码存在数据争用的问题,因为函数foo实际上是两条指
-令(在64位环境下用gcc -s可以查看汇编码):
-
-```asm
-    foo:
-      ...
-      movl count(%rip), %eax
-      addl$2, %eax
-      ...
-```
-
-比较常用的解决办法是使用锁把相关的内存区域保护起来:
-
-```c
-   #include <pthread.h>
-   #include <stdio.h>
-
-   int count = 0;
-   pthread_mutex_t mutex;
-
-   void* foo(void* arg) {
-       pthread_mutex_lock(&mutex);
-       count = count + 2;
-       pthread_mutex_unlock(&mutex);
-   }
-
-   int main() {
-       pthread_t t1, t2;
-       void* retval;
-       int parg1 = 1;
-       int parg2 = 2;
-
-       pthread_create(&t1, 0, foo, 0);
-       pthread_create(&t2, 0, foo, 0);
-       pthread_join(t1, &retval);
-       pthread_join(t2, &retval);
-       printf ("%d\n", count);
-   }
-```
-
-或者使用原子指令:
-
-```c
-   #include <pthread.h>
-   #include <stdio.h>
-
-   int count = 0;
-
-   void* foo(void* arg) {
-       __sync_fetch_and_add(&count, 2);
-   }
-
-   int main() {
-       pthread_t t1, t2;
-       void* retval;
-       int parg1 = 1;
-       int parg2 = 2;
-
-       pthread_create(&t1, 0, foo, 0);
-       pthread_create(&t2, 0, foo, 0);
-       pthread_join(t1, &retval);
-       pthread_join(t2, &retval);
-       printf ("%d\n", count);
-   }
-```
-
-再看编译后的汇编代码:
-
-```asm
-   foo:
-       lock addl       $2, count(%rip)
-```
-
-上面谈的是关于并发的基础知识, 对一个支持并发事务的数据库来说,也会有数据争用的问题,所以必须提供一套锁机制.
-在上面的例子里使用的是互斥锁,这种锁对于一个数据库事务来说粒度太粗,有时候事务仅仅是对某张表做读操作(比如select),并不想堵塞其他事务读这张表,postgresql定义了SHARE锁,这种锁可以被多个事务加在同一张表上,但只要有一个事务没有释放锁,那么另外的事务就不能写这张表了.因为对一张表做写操作需要给这张表上EXCLUSIVE锁, 一旦对一张表加了这种锁,其他事务对这张表既不能写也不能读.
-
-对于现今的应用程序,有很多场景需要对一张表频繁的写,如果每次写都加
-EXCLUSIVE锁,那么性能是非常低的,因为有时业务在一个事务写表的时候并不
-介意另外的事务去读表,所以,对于这种场景,可以使用ACCESS EXCLUSION锁,顾名
-思义,这种锁的意思是一旦有事务对一张表加锁,那么其他的事务不能对这张表做
-写操作,但可以读.相对应的锁是ACCESS SHARE锁,这是粒度最小的锁,当还有事务
-在读一张表的时候,也允许其他事务写.postgresql在上面4种锁模式上还做了写
-扩充,具体可以看源码:
-
-```c
-   /* NoLock is not a lock mode, but a flag value meaning "don't get a lock" */
-   #define NoLock               0
-
-   #define AccessShareLock      1/* SELECT */
-   #define RowShareLock         2/* SELECT FOR UPDATE/FOR SHARE */
-   #define RowExclusiveLock3/* INSERT, UPDATE, DELETE */
-   #define ShareUpdateExclusiveLock 4/* VACUUM (non-FULL),ANALYZE, CREATE
-   * INDEX CONCURRENTLY */
-   #define ShareLock5/* CREATE INDEX (WITHOUT CONCURRENTLY) */
-   #define ShareRowExclusiveLock6/*
-   * SHARE */
-   #define ExclusiveLock7/* blocks ROW SHARE/SELECT...FOR
-   * UPDATE */
-   #define AccessExclusiveLock 8/* ALTER TABLE, DROP TABLE, VACUUM
-   * FULL, and unqualified LOCK TABLE */
-```
-
-当执行select操作时,会自动给相关的表加上一把AccessShareLock锁,上面提到
-这是粒度最小的锁,只与AccessExclusiveLock锁模式冲突.
-
-当执行select ... for update或者 select ... for share的时候,会给相关的
-表加上一把RowShareLock锁,同时还有一把ExclusiveLock锁,锁的是相关的事
-务.RowShareLock是配合行锁使用的,表示前这个事务今后可能会对这张表的一
-些行做update操作, 一旦拿到了这把锁,那么其他的表就不能对这些行做dml操作
-了.可以看看这种锁:
-
-```shell
-    >> BEGIN;
-    >> select * from t where id=1 for update;
-
-    id | detail
-    ----+--------
-    1 | test2
-    1 | test1
-    1 | test1
-    1 | test1
-    1 | test2
-    (5 rows)
-
-    >> select txid_current();
-
-    txid_current
-    --------------
-    733
-
-    >> select locktype, mode, transactionid from  pg_locks;
-
-    locktype    |      mode       | transactionid
-    ---------------+-----------------+---------------
-    relation      | AccessShareLock |
-    virtualxid    | ExclusiveLock   |
-    relation      | RowShareLock    |
-    virtualxid    | ExclusiveLock   |
-    transactionid | ExclusiveLock   |           733
-    (5 rows)
-```
-
-当执行insert/update/delete操作时, 会给相关的表加上RowExclusiveLock锁,
-同时加一把ExclusiveLock锁,锁的是相关的事务. ExclusiveLock锁是粒度最粗
-的锁, 与所有锁模式冲突,只有在对表做ddl操作或者vacuum full时会加上这把
-锁.
-
-余下的锁模式可以看文档或者源代码,里面有非常详细的介绍.
-
-对于一个长时间运行的事务,如果锁的粒度太大,肯定是非常影响性能的,可以
-根据业务场景从应用层做些調优,比如优化程序设计,或者调整表结构, 再者,尽
-量使用使用粒度小的锁.
-
-
-对于一个长时间运行的事务,如果锁的粒度太大,肯定是非常影响性能的,可以
-根据业务场景从应用层做些調优,比如优化程序设计,或者调整表结构, 再者,尽
-量使用使用粒度小的锁.
-
-postgresql的锁类型有很多,可以给很多对象加锁,并不限于表和行, 下面列出
-了postgresql所有的锁类型:
-
-```c
-   typedef enum LockTagType
-   {
-        LOCKTAG_RELATION,/* whole relation */
-        /* ID info for a relation is DB OID + REL OID; DB OID = 0 if shared */
-        LOCKTAG_RELATION_EXTEND,/* the right to extend a relation */
-        /* same ID info as RELATION */
-        LOCKTAG_PAGE,/* one page of a relation */
-        /* ID info for a page is RELATION info + BlockNumber */
-        LOCKTAG_TUPLE,/* one physical tuple */
-        /* ID info for a tuple is PAGE info + OffsetNumber */
-        LOCKTAG_TRANSACTION,/* transaction (for waiting for xact done) */
-        /* ID info for a transaction is its TransactionId */
-        LOCKTAG_VIRTUALTRANSACTION, /* virtual transaction (ditto) */
-        /* ID info for a virtual transaction is its VirtualTransactionId */
-        LOCKTAG_OBJECT,/* non-relation database object */
-       /* ID info for an object is DB OID + CLASS OID + OBJECT OID + SUBID */
-
-       /*
-        * Note: object ID has same representation as in pg_depend and
-        * pg_description, but notice that we are constraining SUBID to 16 bits.
-        * Also, we use DB OID = 0 for shared objects such as tablespaces.
-        */
-       LOCKTAG_USERLOCK,/* reserved for old contrib/userlock code */
-       LOCKTAG_ADVISORY/* advisory user locks */
-   } LockTagType;
-```
-
-LOCKTAG_RELATION锁的整个relation,比如说一张表.
-
-LOCKTAG_RELATION_EXTEND只适用与一种场景,就是当某个relation空间不够了,
-在扩展空间前,需要加上这种锁.
-
-LOCKTAG_PAGE锁的是relation的一页,比如一张表的某一页,粒度较
-LOCKTAG_RELATION要小.
-
-LOCKTAG_TUPLE锁的是一个tuple,比如一张表里的一行记录,粒度较
-LOCKTAG_PAGE要小.
-
-LOCKTAG_TRANSACTION锁的是一个事务.
-
-LOCKTAG_VIRTUALTRANSACTION锁的是一个虚拟事务.
-
-LOCKTAG_OBJECT锁的是一个非数据库对象.
-
-LOCKTAG_ADVISORY是应用程序自定义锁,行为上类似linxu下的advisory lock文件锁.
-
-advisory lock是一种应用级的锁,在postgresql9.1之前只有session级别的,在
-不需要锁的时候需要主动释放.9.1引入了事务级别的,当事务结束自动释放. 这
-种锁并不是强制行的,不同的事务要事先做个约定,必须保证在自己的事务执行
-dml或者dll指令前获取到advisory锁,如果没有获得锁就执行dml或dll指令,那么
-指令也不会被堵塞,但这样明显有问题. 这种特性其实就是linux的文件
-锁:advisory lock的实现,可以看看这篇文章:
-http://www.thegeekstuff.com/2012/04/linux-file-locking-types/
-
-另外所谓的行锁,在postgresql其实也是对表的锁定,可以看官方文档并发控制那
-章对锁模式的分类,凡是前面带ROW的锁都跟行锁定有关.当在一个事务里执行
-"select ... from ... where ... for update/share;",那么postgresql会加一
-把ExclusiveLock锁住当前事务,加一把RowShareLock锁住相关的表,这时其他事
-务对相关的行可读但不可写.
-
-
-## 关于postgresql的多版本并发控制,事务隔离性细节
-
-对于一个事务来说,有几种必要的状态,来标识事务目前所处的阶段.事务的任何
-一个操作结束后,都必须映射到一种状态:
-
-  活动状态:
-    表示事务开始执行.
-
-  待提交状态:
-    当执行完最后一条指令,还未执行END或者COMMIT之前,事务处于待提交状态,这
-    时事务已经正确完成了所有操作,但还未被数据库所应用.
-
-  失败待状态:
-    任何一个失败的操作将导致事务进入此状态,这时需要回滚数据库.
-
-  失败已回滚状态:
-    执行ROLLBACK后到达此状态,事务结束.
-
-  成功提交状态:
-    执行END或COMMIT操作成功,到达此状态,事物结束.
-
-在postgresql里,为COMMIT的事务所做的操作结果其他事务是看不到的,因为
-postgresql没有read uncommitted级别,在事务没有commited前,事务所做的操作
-结果仅仅是保存在当前的快照,对其他事务是不可见的.postgresql使用MVCC来
-实现事务的隔离性,只要不使用ACCESS EXCLUSIVE锁,那么写不会堵塞读.使用
-MVCC的数据库有很多,但实现机制各不相同,主要区别在于对多个版本数据的处理,
-在对一张表做DML操作时,postgresql给相关的行附着了一些额外的信息,用于标
-识相关的行最近被那条已经commit了的事务更新了(xmin),被哪条正在执行的事
-务锁住了(xmax).这些信息就是postgresql实现事务的隔离性的关键,比如事务A
-使用read committed级别只能读到xmin比自己事务id(xid)大或者等于的行记录,
-使用repeatable read和serializable级别只能读到xmin比自己事务id小或者等
-于的行记录.当xmax大于自己的事务id时,此条记录不可写.上面有几个重要的
-列名: xid指的是事务的id,xmin指的是插入或更新该条记录的xid,xmax指的是删
-除或锁定该条记录的xid:
-
-```c
-  typedef struct HeapTupleFields
-  {
-      TransactionId t_xmin;/* inserting xact ID */
-      TransactionId t_xmax;/* deleting or locking xact ID */
-      union
-      {
-          CommandIdt_cid;/* inserting or deleting command ID, or both */
-          TransactionId t_xvac;/* old-style VACUUM FULL xact ID */
-      }t_field3;
-  } HeapTupleFields;
-```
-
-在每个事务所读到的快照里,xmin可以认为存的是最近更新过此条记录并且已经
-commited的事务的id,xmax可以认为存的是当前正在对此条行记录做DML操作的事
-务的id.
-
-这里可以实验一下 在两个session里分别开启一个事务, t1和t2:
-
-```shell
-    >> create table t(id integer, detail text);
-    >> insert into t (id, detail) values(1,'test1');
-    >> select xmin, xmax, * from t;
-
-    xmin | xmax | id | detail
-    ------+------+----+--------
-    715 |    0 |  1 | test1
-
-
-    >> begin;
-    >> update t set detail='test2' where id=1;
-    >> select xmin, xmax, * from t where id=1;
-
-    xmin | xmax | id | detail
-    ------+------+----+--------
-    716 |    0 |  1 | test2
-
-    >> select txid_current();
-
-    txid_current
-    --------------
-    716
-
-    # 可以看到当t1执行了update操作后xmin变成了自己的xid,而xmax为0,那么这时切换到t2
-
-    >> begin;
-    >> select txid_current();
-
-    txid_current
-    --------------
-    717
-
-    >> select xmin, xmax, * from t where id=1;
-
-    xmin | xmax | id | detail
-    ------+------+----+--------
-    715 |  716 |  1 | test1
-
-    # 在t2的快照里,xmin为715,xmax为716,detail为test1,说明目前t1对这一行的更新对于t2
-    # 是不可见的, t2只能读到比xmax较小的版本,下面我们切到t1做一次commit:
-
-    >> commit;
-
-    # 再切到t2:
-
-    >> select xmin, xmax, * from t where id=1;
-    xmin | xmax | id | detail
-    ------+------+----+--------
-    716 |  0 |  1 | test2
-
-    # t1 commit后, t2可以读到t1做的更新了,同时xmax变为了0,说明当前没有其
-    # 他未committed的事务对此行做过更新.这里之所以t2可以读t1的更新是因为
-    # postgresql默认使用的是read committed事务隔离级别,若使用
-    # repeatable read或者serializable隔离级别或者t1对此行加了锁(比如
-    # select for update), 则是读不到的,指定隔离级别的语法:
-
-    >> begin;
-    >> SET TRANSACTION ISOLATION LEVEL SERIALIZABLE;
-```
-
-在一个事务内,对于一条记录,每做一次DML操作,postgresql都会存储相关操作
-的结果.只是因为隔离级别的限制,其他事务可能无法读到而已:
-
-```c
-     typedef struct HeapTupleHeaderData
-     {
-         ...
-         ItemPointerData t_ctid;/* current TID of this or newer tuple */
-         ...
-    } HeapTupleHeaderData;
-```
-
-对于每个事务,当执行一次DML操作时,实际上postgresql会为此次操作保存一份
-新的副本,并不会替换之前已经存在的数据, 比如update操作:
-
-```shell
-    >> select ctid, * from t where id=1;
-
-    ctid | id | detail
-    ------+----+--------
-    (0, 3) | 1 | test2 |
-
-    >> update t set detail="test3" where id=1;
-    >> select ctid, * from t where id=1;
-
-    ctid | id | detail
-    ------+----+--------
-    (0, 4) | 1 | test3 |
-
-    # 这里的ctid指的是一个表示(存储的数据块,偏移量）的tuple,在此事务
-    # update之前,ctid的值是(0,3),update后,ctid的值变成了(0,4),说明
-    #  postgresql并没有在update后覆盖之前的数据,而是新产生了一份数据.这
-    #  么一来,当系统执行update操作非常多的情况下,必定会有大量的dead
-    # tuples存在.postgresql默认会启动一个专门用于清除dead tuples的进程:
-
-    >> ps ax | grep postgres
-
-       824 ?        Ss     0:06 postgres: autovacuum launcher process
-
-    # autovacuum会判断当前dead tuples的数量是否达到了一个阈值(可配置),如
-    # 果达到了阈值范围,则会执行清理操作.这个阈值的参数设置非常重要,需要根
-    # 据具体业务做取舍,如果阈值设的非常大,那么执行清理操作的过程会非常耗
-    # 时,且数据库会有大量冗余数据,如果设的非常小,那么也会给系统带来不少
-    # 压力.具体的配置参数可以参考文档:
-    # http://www.postgresql.org/docs/9.1/static/runtime-config-autovacuum.html
-```
-
-## 关于postgresql的并发控制,ACID实现细节
-
-一个可靠的关系数据库事务必须实现ACID特性,即原子性,一致性,隔离性,持久性.
-
-事务的原子性跟CPU提供的原子指令有一定区别,原子指令是一条指令,本质上
-就是串行的,而事务的原子性只保证事务中的指令,要么都执行,要么都不执行,
-至于是否需要串行化,取决于事务的隔离级别.
-
-事务的一致性指的是一个事务执行前后数据库都必须处于正确状态.如果一个事
-务成功commit了,那么数据库必须正确地应用此事务的所有操作,如果事物
-rollback了,那么数据库必须回滚此次事务中的所有操作.
-
-事务的隔离性指的是多个事务间的操作可见性.sql标准定义了4个隔离级别:
-
-1. Read Uncommitted(读未提交)
-
-  即一个事务在执行过程中可以读其他事务已更新或插入但尚未commit的行.
-
-2. Read Commited(读已提交)
-
-  即一个事务在执行过程中可以读其他事务已经更新或插入并且commit了的行.
-
-  3. Repeatable Read(可重复读)
-
-  即一个事务在执行过程中可以读其他事务已经插入并且commit了的行,不能读
-  已经更新了的行.
-
-4. Serializable(串行)
-
-  同一时间只允许一个事务执行,不允许并发,所以不存在可见性的问题串行是
-  最安全的隔离级别,但失去了并发性,而其他隔离级别在有事务并发执行时都
-  会有一些问题,可以归纳为以下4种：
-
-  1. 丢失更新
-
-  事务t1和t2并发访问表a：
-
-  step | t1 | t2
-    ------------ | ---------------------- | ------------
-    1            | begin;                 |
-    2            |                        | begin;
-    3            | select id from a;      |
-    4            | newid=id + 2;          |
-    5            |                        | select id from a;
-    6            | update a set id=newid; |
-    7            |                        | update a set id=newid;
-    8            | commit;                |
-    9            |                        | commit;
-
-  这里很明显t1对表a的相关行更新被丢失了,假如两个事务尚未执行前id的值是
-  5,两个事务执行完毕后id的值会是8,而不是10Read Uncommitted隔离级别会造
-  成此问题.
-
-  2. 脏读:
-
-  事务t1和t2并发访问表a:
-
-  | step | t1                    | t2                    |
-     |------|-----------------------|-----------------------|
-     |    1 | begin;                |                       |
-     |    2 |                       | begin;                |
-     |    3 | select id from a;     |                       |
-     |    4 | update a set id=id+2; |                       |
-     |    5 |                       | update a set id=id+2; |
-     |    6 | rollback;             |                       |
-     |    7 |                       | commit;               |
-
-  这里t1最终rollback了,但它之前的对表a的一些行的更新结果被t2读到了,所
-  以t2实际上读到的是脏数据.Read Uncommitted隔离级别会造成此问题.
-
-
-  3. 不可重复读
-
-  事务t1和t2并发访问表a:
-
-  | step | t1                    | t2                    |
-    |------|-----------------------|-----------------------|
-    |    1 | begin;                |                       |
-    |    2 |                       | begin;                |
-    |    3 |                       | update a set id=id+2; |
-    |    4 |                       | commit;               |
-    |    5 | update a set id=id+2; |                       |
-    |    6 | commit;               |                       |
-
-  这里t1在update的时候id的值已经被t2更新过了,而与t1 begin时id的值不一
-  致.read uncommitted 和read committed隔离级别会造成此问题
-
-  4. 幻象读
-
-  事务t1和t2并发访问a表:
-
-  | step | t1                          | t2                            |
-    |------|-----------------------------|-------------------------------|
-    |    1 | begin;                      |                               |
-    |    2 |                             | begin;                        |
-    |    3 |                             | insert into a (id) values (5) or delete table a where id=5|
-    |    4 |                             | commit;                       |
-    |    5 | select id from a where id=5 |                               |
-    |    6 | commit;                     |                               |
-
-  在这里t1会读到t2新插入的一行或本来应该读到的行被t2删除了,这就是幻象
-  读.read uncommitted,read committed,repeatable read隔离级别会造成
-  此问题.
-
-事务的持久性指的是一旦事务成功提交,那么此事务的执行结果就不应该被丢失.
-其实数据丢失问题是不可能避免的,所以关系数据库大多会提供数据恢复机制.
