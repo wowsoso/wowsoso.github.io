@@ -857,10 +857,4 @@ contextswitch函数是由taskscheduler函数驱动的,taskscheduler是一个task
 这样更具灵活性,因为有时候task需要主动让出CPU,这是一个通用的模式:在即将
 执行堵塞系统调用前主动让出CPU.
 
-libtask会独占main函数, 在main函数里会执行调度器:taskscheduler, 所以在
-自己的程序里不能有main函数了,但实际上可以绕过这个机制,稍微hack下
-task.c,由自己的程序去调用taskscheduler.另外libtask只是一个基础的封装,
-直接拿来使用除了能直接在c语言中体验协作式编程的机制并不能对程序性能带
-来提升,github上有一个使用epoll的修改版本可以让异步编程更加轻松一点,另
-外如果想要利用多核, 那么还是得加上线程机制,在每个线程里跑多个task,不
-过如果要实现这个要做的工作可就多了.
+github上有一个使用epoll的修改版本,另外如果想要利用多核, 还是需要使用线程,在每个线程里跑多个task,不过如果要实现这个工作量还比较大.
