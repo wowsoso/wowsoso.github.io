@@ -9,7 +9,7 @@
 ##### 成功:
 ![Alt text](http://wowsoso-common.oss-cn-beijing.aliyuncs.com/a1.png)
 
-#### 失败:
+##### 失败:
 ![Alt text](http://wowsoso-common.oss-cn-beijing.aliyuncs.com/a2%20%282%29.png)
 
 每个服务有两种角色, 事件发布者和接收者
