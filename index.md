@@ -12,7 +12,7 @@
 #### 失败:
 ![Alt text](http://wowsoso-common.oss-cn-beijing.aliyuncs.com/a2%20%282%29.png)
 
-每个服务有两种角色, 事件发布者和接受者
+每个服务有两种角色, 事件发布者和接收者
 
 事件发布者需要考虑:
 * 存储发送事件, 便于redo
